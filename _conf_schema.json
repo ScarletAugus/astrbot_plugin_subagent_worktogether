@@ -1,0 +1,38 @@
+{
+  "max_delegation_depth": {
+    "description": "最大委派深度",
+    "type": "int",
+    "default": 3,
+    "hint": "Limits how deep agents can delegate to each other (A→B→C = depth 2). Prevents infinite loops."
+  },
+  "max_calls_per_agent": {
+    "description": "全局统计：单个Agent可被调用的最大次数",
+    "type": "int",
+    "default": 3,
+    "hint": "Limits total calls to the same agent across all callers within one event."
+  },
+  "max_calls_per_pair": {
+    "description": "单次执行中：单个Agent可调用某个Agent的最大次数",
+    "type": "int",
+    "default": 3,
+    "hint": "Limits how many times agent A can call agent B in a single execution. Resets when A re-enters via a chain (A→B→C→A)."
+  },
+  "max_total_delegations": {
+    "description": "全局统计：所有Agent可被调用的最大次数",
+    "type": "int",
+    "default": 10,
+    "hint": "Hard cap on total delegation calls in one event, regardless of which agents are involved. Prevents runaway token costs."
+  },
+  "delegation_timeout": {
+    "description": " 委派超时时间 ",
+    "type": "float",
+    "default": 120.0,
+    "hint": "If a delegated agent takes longer than this, it will be cancelled and an error returned."
+  },
+  "max_task_length": {
+    "description": "任务描述长度限制",
+    "type": "int",
+    "default": 4000,
+    "hint": "Rejects task descriptions longer than this to prevent excessive token usage."
+  }
+}
