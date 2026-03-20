@@ -1,6 +1,6 @@
 name: astrbot_plugin_subagent_worktogether
 display_name: SubAgent WorkTogether
-desc: 能够支持子Agent之间直接互相委托任务/Send tasks to a specific main/sub agent via commands.
+desc: 能够支持子Agent之间直接通信，可以控制互相通信的深度和次数，可以输出Agent互相通信的完整链路
 version: v1.1.0
 author: ScarletAugus
 repo: https://github.com/ScarletAugus/astrbot_plugin_subagent_worktogether
