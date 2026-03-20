@@ -1,21 +1,25 @@
 """
 SubAgent WorkTogether Plugin / 子代理协作插件
 
-Registers two LLM function-calling tools so that any agent can delegate tasks
+Registers LLM function-calling tools so that any agent can delegate tasks
 to other configured sub-agents and receive their responses.
-Supports cross-agent delegation with recursion depth protection and
-per-agent call count limiting (both configurable via WebUI).
+Supports cross-agent delegation with recursion depth protection,
+per-agent call count limiting, and delegation trace reporting
+(all configurable via WebUI).
 
-注册两个 LLM function-calling 工具，使任意 Agent 都可以将任务委派给其他
+注册 LLM function-calling 工具，使任意 Agent 都可以将任务委派给其他
 已配置的子代理，并获取其回复结果。
-支持跨代理委派，并带有递归深度保护和单代理调用次数限制机制
+支持跨代理委派，并带有递归深度保护、单代理调用次数限制和委派追踪报告
 （均可通过 WebUI 配置）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextvars
+import datetime
+import time
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -24,6 +28,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.message import Message
 from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.register import llm_tools
 
 # Tracks the current delegation depth per async call chain to prevent infinite loops.
@@ -50,6 +55,7 @@ _caller_target_counts: contextvars.ContextVar[dict[str, int] | None] = (
 # automatically cleaned up when the event is garbage-collected.
 _CALL_COUNTS_KEY = "_subagent_call_counts"
 _TOTAL_DELEGATION_COUNT_KEY = "_subagent_total_delegation_count"
+_DELEGATION_TRACE_KEY = "_delegation_trace"
 
 MAIN_AGENT_NAME = "main"
 
@@ -59,8 +65,47 @@ _DEFAULT_MAX_CALLS_PER_PAIR = 3
 _DEFAULT_MAX_TOTAL_DELEGATIONS = 10
 _DEFAULT_DELEGATION_TIMEOUT = 120.0
 _DEFAULT_MAX_TASK_LENGTH = 4000
+_DEFAULT_AUTO_SEND_TRACE = False
+_DEFAULT_DISABLE_NATIVE_HANDOFFS = False
 
 _ERROR_PREFIX = "[DELEGATION_ERROR]"
+
+_TRACE_HTML_TEMPLATE = """\
+<div style="font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; \
+max-width: 640px; padding: 24px; background: #fff;">
+  <h2 style="border-bottom: 2px solid #4A90D9; padding-bottom: 8px; \
+margin-top: 0; color: #333;">
+    Delegation Trace Report
+  </h2>
+  {% for entry in trace %}
+  <div style="margin: 14px 0; padding: 12px; border-radius: 6px; \
+border-left: 4px solid {{ '#4A90D9' if entry.status == 'success' else '#E74C3C' }}; \
+background: {{ '#F7FAFC' if entry.status == 'success' else '#FDF2F2' }};">
+    <div style="font-size: 12px; color: #999; margin-bottom: 4px;">
+      Step {{ loop.index }} &middot; Depth {{ entry.depth }} \
+&middot; {{ entry.time_str }}
+    </div>
+    <div style="font-size: 15px; margin: 6px 0;">
+      <strong style="color: #4A90D9;">{{ entry.caller }}</strong>
+      <span style="color: #999;">&rarr;</span>
+      <strong style="color: #2ECC71;">{{ entry.target }}</strong>
+    </div>
+    <div style="font-size: 13px; color: #555; margin: 6px 0; \
+line-height: 1.5;">
+      <em>Task:</em> {{ entry.task_short }}
+    </div>
+    <div style="font-size: 13px; color: #333; margin: 6px 0; \
+line-height: 1.5;">
+      <em>Response:</em> {{ entry.response_short }}
+    </div>
+  </div>
+  {% endfor %}
+  <div style="font-size: 12px; color: #bbb; margin-top: 18px; \
+text-align: right;">
+    Total steps: {{ trace|length }}
+  </div>
+</div>
+"""
 
 
 def _get_call_counts(event: AstrMessageEvent) -> dict[str, int]:
@@ -94,11 +139,20 @@ def _get_caller_target_counts() -> dict[str, int]:
     return counts
 
 
+def _get_delegation_trace(event: AstrMessageEvent) -> list[dict]:
+    """Retrieve or initialize the per-event delegation trace list."""
+    trace = event.get_extra(_DELEGATION_TRACE_KEY)
+    if trace is None:
+        trace = []
+        event.set_extra(_DELEGATION_TRACE_KEY, trace)
+    return trace
+
+
 @register(
     "subagent_worktogether",
     "auguscao",
-    "Provides an LLM tool that lets any agent delegate tasks to other agents.",
-    "1.0.2",
+    "Provides LLM tools for multi-agent delegation with trace reporting.",
+    "1.1.0",
 )
 class SubAgentWorkTogether(Star):
     context: Context
@@ -124,6 +178,80 @@ class SubAgentWorkTogether(Star):
         self.max_task_length: int = int(
             cfg.get("max_task_length", _DEFAULT_MAX_TASK_LENGTH)
         )
+        self.auto_send_trace: bool = bool(
+            cfg.get("auto_send_trace", _DEFAULT_AUTO_SEND_TRACE)
+        )
+        self.disable_native_handoffs: bool = bool(
+            cfg.get("disable_native_handoffs", _DEFAULT_DISABLE_NATIVE_HANDOFFS)
+        )
+        self._last_traces: collections.OrderedDict[str, list[dict]] = (
+            collections.OrderedDict()
+        )
+
+    async def initialize(self) -> None:
+        self._sync_native_handoff_state()
+
+    async def terminate(self) -> None:
+        self._reactivate_native_handoffs()
+
+    @filter.on_llm_request()
+    async def _on_llm_request(self, event: AstrMessageEvent, request) -> None:
+        """Sanitize the request ToolSet before the LLM sees it.
+
+        1. Remove native HandoffTools when ``disable_native_handoffs`` is True.
+           Setting ``active=False`` alone is insufficient because the default
+           "full" schema mode (openai_schema / anthropic_schema / google_schema)
+           does **not** check the ``active`` flag.
+        2. Remove ``send_delegation_summary`` when ``auto_send_trace`` is False
+           so the LLM cannot spontaneously call it without being prompted.
+        """
+        if not hasattr(request, "func_tool") or not request.func_tool:
+            return
+
+        names_to_remove: set[str] = set()
+
+        if self.disable_native_handoffs:
+            self._sync_native_handoff_state()
+            for t in request.func_tool.tools:
+                if isinstance(t, HandoffTool):
+                    names_to_remove.add(t.name)
+
+        if not self.auto_send_trace:
+            names_to_remove.add("send_delegation_summary")
+
+        if not names_to_remove:
+            return
+
+        before = len(request.func_tool.tools)
+        request.func_tool.tools = [
+            t for t in request.func_tool.tools if t.name not in names_to_remove
+        ]
+        removed = before - len(request.func_tool.tools)
+        if removed:
+            logger.debug(
+                "on_llm_request: removed %d tool(s) from request ToolSet: %s",
+                removed,
+                names_to_remove,
+            )
+
+    def _sync_native_handoff_state(self) -> None:
+        """Deactivate native HandoffTools when disable_native_handoffs is True."""
+        orch = self.context.subagent_orchestrator
+        if not orch or not orch.handoffs:
+            return
+        for h in orch.handoffs:
+            if self.disable_native_handoffs:
+                h.active = False
+            else:
+                h.active = True
+
+    def _reactivate_native_handoffs(self) -> None:
+        """Re-enable native HandoffTools (called on plugin terminate/reload)."""
+        orch = self.context.subagent_orchestrator
+        if not orch or not orch.handoffs:
+            return
+        for h in orch.handoffs:
+            h.active = True
 
     # ------------------------------------------------------------------ #
     # LLM Tool: delegate_task_to_agent
@@ -143,9 +271,14 @@ class SubAgentWorkTogether(Star):
             agent_name(string): The name of the target agent. Use "main" for the main agent, or use list_available_agents to see all available agents.
             task(string): A SELF-CONTAINED task description. Include all necessary context — do not use pronouns like 'it' or 'this' that refer to earlier conversation.
         """
+        self._sync_native_handoff_state()
+
         # --- Input validation ---
         if not agent_name or not agent_name.strip():
             return f"{_ERROR_PREFIX} agent_name must not be empty."
+
+        if not task or not task.strip():
+            return f"{_ERROR_PREFIX} task must not be empty."
 
         if self.max_task_length > 0 and len(task) > self.max_task_length:
             return (
@@ -213,29 +346,67 @@ class SubAgentWorkTogether(Star):
         _increment_total_delegation_count(event)
 
         # --- Handle delegation to the main agent ---
+        caller_name = _current_agent.get() or "(user)"
         if agent_name.lower() == MAIN_AGENT_NAME:
-            return await self._invoke_main_agent(event, task, current_depth)
+            result = await self._invoke_main_agent(event, task, current_depth)
+        elif not orch or not orch.handoffs:
+            result = f"{_ERROR_PREFIX} No subagent orchestrator configured or no agents available."
+        else:
+            handoff = self._find_handoff(orch.handoffs, agent_name)
+            if not handoff:
+                available = [h.agent.name for h in orch.handoffs] + [MAIN_AGENT_NAME]
+                result = (
+                    f"{_ERROR_PREFIX} Agent '{agent_name}' not found. "
+                    f"Available agents: {', '.join(available)}"
+                )
+            else:
+                try:
+                    llm_resp = await self._invoke_subagent(
+                        event, handoff, task, current_depth
+                    )
+                    result = (
+                        llm_resp.completion_text or "(Agent returned empty response)"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to delegate task to agent '{agent_name}': {e}"
+                    )
+                    result = (
+                        f"{_ERROR_PREFIX} Delegation to agent '{agent_name}' failed: {e}. "
+                        f"Please try to solve the task yourself or use another agent."
+                    )
 
-        if not orch or not orch.handoffs:
-            return f"{_ERROR_PREFIX} No subagent orchestrator configured or no agents available."
+        # --- Record trace entry ---
+        is_error = result.startswith(_ERROR_PREFIX)
+        trace = _get_delegation_trace(event)
+        trace.append(
+            {
+                "caller": caller_name,
+                "target": agent_name,
+                "task": task,
+                "response": result,
+                "status": "error" if is_error else "success",
+                "depth": current_depth,
+                "timestamp": time.time(),
+            }
+        )
+        self._last_traces[event.unified_msg_origin] = list(trace)
+        if len(self._last_traces) > 1000:
+            self._last_traces.popitem(last=False)
 
-        handoff = self._find_handoff(orch.handoffs, agent_name)
-        if not handoff:
-            available = [h.agent.name for h in orch.handoffs] + [MAIN_AGENT_NAME]
-            return (
-                f"{_ERROR_PREFIX} Agent '{agent_name}' not found. "
-                f"Available agents: {', '.join(available)}"
-            )
+        # --- Auto-send hint (only at top-level, only once per event) ---
+        if self.auto_send_trace and current_depth == 0 and not is_error:
+            already_hinted = event.get_extra("_trace_hint_sent", False)
+            if not already_hinted:
+                event.set_extra("_trace_hint_sent", True)
+                result += (
+                    "\n\n[System] After you have completed ALL delegations for "
+                    "the user's request, please call the `send_delegation_summary` "
+                    "tool exactly ONCE to send the collaboration trace report "
+                    "to the user."
+                )
 
-        try:
-            llm_resp = await self._invoke_subagent(event, handoff, task, current_depth)
-            return llm_resp.completion_text or "(Agent returned empty response)"
-        except Exception as e:
-            logger.error(f"Failed to delegate task to agent '{agent_name}': {e}")
-            return (
-                f"{_ERROR_PREFIX} Delegation to agent '{agent_name}' failed: {e}. "
-                f"Please try to solve the task yourself or use another agent."
-            )
+        return result
 
     # ------------------------------------------------------------------ #
     # LLM Tool: list_available_agents
@@ -275,6 +446,42 @@ class SubAgentWorkTogether(Star):
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
+    # LLM Tool: send_delegation_summary
+    # ------------------------------------------------------------------ #
+    @llm_tool(name="send_delegation_summary")
+    async def send_delegation_summary(self, event: AstrMessageEvent) -> str:
+        """Send a formatted delegation trace report to the user as an image or text message. The report is sent directly and does NOT enter conversation context.
+
+        Call this tool exactly ONCE after all delegations are complete. It requires no arguments — the trace is recorded automatically during delegations.
+        """
+        if _delegation_depth.get() > 0:
+            return "This tool can only be called by the top-level agent, not from within a delegated sub-task."
+
+        already_sent = event.get_extra("_trace_summary_sent", False)
+        if already_sent:
+            return (
+                "Delegation summary has already been sent. Do not call this tool again."
+            )
+        event.set_extra("_trace_summary_sent", True)
+
+        trace = event.get_extra(_DELEGATION_TRACE_KEY)
+        if not trace:
+            return "No delegation trace found for this event."
+
+        try:
+            rendered = await self._render_trace_image(trace)
+            if rendered.startswith("http"):
+                await event.send(MessageChain().url_image(rendered))
+            else:
+                await event.send(MessageChain().file_image(rendered))
+        except Exception as exc:
+            logger.warning(f"t2i rendering failed, falling back to text: {exc}")
+            text = self._format_trace_text(trace)
+            await event.send(MessageChain().message(text))
+
+        return "Delegation summary has been sent to the user."
+
+    # ------------------------------------------------------------------ #
     # Chat Command: /agents
     # ------------------------------------------------------------------ #
     @filter.command("agents")
@@ -305,6 +512,25 @@ class SubAgentWorkTogether(Star):
                 f"  Tools: {tools_display}"
             )
         yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------------ #
+    # Chat Command: /trace
+    # ------------------------------------------------------------------ #
+    @filter.command("trace")
+    async def cmd_trace(self, event: AstrMessageEvent):
+        """View the last delegation trace. / 查看上次委派追踪记录。"""
+        umo = event.unified_msg_origin
+        trace = self._last_traces.get(umo)
+        if not trace:
+            yield event.plain_result("No delegation trace found for this conversation.")
+            return
+
+        try:
+            rendered = await self._render_trace_image(trace)
+            yield event.image_result(rendered)
+        except Exception:
+            text = self._format_trace_text(trace)
+            yield event.plain_result(text)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -341,6 +567,8 @@ class SubAgentWorkTogether(Star):
         toolset = ToolSet()
         for registered_tool in llm_tools.func_list:
             if isinstance(registered_tool, HandoffTool):
+                continue
+            if registered_tool.name == "send_delegation_summary":
                 continue
             if not can_still_delegate and registered_tool.name in (
                 "delegate_task_to_agent",
@@ -402,7 +630,11 @@ class SubAgentWorkTogether(Star):
     ):
         """Invoke a sub-agent: build its toolset, resolve provider, prepare
         dialog context, then run a full tool-loop agent cycle."""
-        toolset = self._build_toolset(handoff.agent.tools)
+        next_depth = current_depth + 1
+        can_still_delegate = next_depth < self.max_delegation_depth
+        toolset = self._build_toolset(
+            handoff.agent.tools, can_delegate=can_still_delegate
+        )
 
         umo = event.unified_msg_origin
         prov_id = (
@@ -454,19 +686,74 @@ class SubAgentWorkTogether(Star):
             _caller_target_counts.set(prev_ct)
             _delegation_depth.set(current_depth)
 
+    async def _render_trace_image(self, trace: list[dict]) -> str:
+        """Render the delegation trace as an image via html_render."""
+        prepared = []
+        for entry in trace:
+            task_text = entry["task"]
+            resp_text = entry["response"]
+            prepared.append(
+                {
+                    **entry,
+                    "time_str": datetime.datetime.fromtimestamp(
+                        entry["timestamp"]
+                    ).strftime("%H:%M:%S"),
+                    "task_short": (
+                        task_text[:200] + "..." if len(task_text) > 200 else task_text
+                    ),
+                    "response_short": (
+                        resp_text[:300] + "..." if len(resp_text) > 300 else resp_text
+                    ),
+                }
+            )
+        return await self.html_render(
+            _TRACE_HTML_TEMPLATE, {"trace": prepared}, return_url=True
+        )
+
     @staticmethod
-    def _build_toolset(tools: list | None) -> ToolSet | None:
+    def _format_trace_text(trace: list[dict]) -> str:
+        """Fallback: format delegation trace as plain text."""
+        lines = ["===== Delegation Trace Report =====\n"]
+        for i, entry in enumerate(trace, 1):
+            ts = datetime.datetime.fromtimestamp(entry["timestamp"]).strftime(
+                "%H:%M:%S"
+            )
+            status = "OK" if entry["status"] == "success" else "ERROR"
+            task_text = entry["task"][:200]
+            resp_text = entry["response"][:300]
+            lines.append(
+                f"[Step {i}] {ts} | depth={entry['depth']} | {status}\n"
+                f"  {entry['caller']} -> {entry['target']}\n"
+                f"  Task: {task_text}\n"
+                f"  Response: {resp_text}\n"
+            )
+        lines.append(f"Total steps: {len(trace)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_toolset(
+        tools: list | None, *, can_delegate: bool = True
+    ) -> ToolSet | None:
         """Build a ToolSet for the sub-agent based on its tool configuration.
 
         - tools=None  -> all registered tools (except HandoffTools),
                          includes delegate_task_to_agent for cross-agent calls
         - tools=[]    -> no tools
         - tools=[...] -> only the specified tools
+
+        When *can_delegate* is False, delegation tools are excluded regardless
+        of the tool list so the LLM doesn't waste a call that would be rejected.
         """
+        _delegation_tool_names = {"delegate_task_to_agent", "list_available_agents"}
+
         if tools is None:
             toolset = ToolSet()
             for registered_tool in llm_tools.func_list:
                 if isinstance(registered_tool, HandoffTool):
+                    continue
+                if registered_tool.name == "send_delegation_summary":
+                    continue
+                if not can_delegate and registered_tool.name in _delegation_tool_names:
                     continue
                 if registered_tool.active:
                     toolset.add_tool(registered_tool)
@@ -478,9 +765,13 @@ class SubAgentWorkTogether(Star):
         toolset = ToolSet()
         for tool_name_or_obj in tools:
             if isinstance(tool_name_or_obj, str):
+                if not can_delegate and tool_name_or_obj in _delegation_tool_names:
+                    continue
                 registered_tool = llm_tools.get_func(tool_name_or_obj)
                 if registered_tool and registered_tool.active:
                     toolset.add_tool(registered_tool)
             elif isinstance(tool_name_or_obj, FunctionTool):
+                if not can_delegate and tool_name_or_obj.name in _delegation_tool_names:
+                    continue
                 toolset.add_tool(tool_name_or_obj)
         return None if toolset.empty() else toolset

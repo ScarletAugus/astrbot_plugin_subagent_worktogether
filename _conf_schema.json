@@ -24,7 +24,7 @@
     "hint": "Hard cap on total delegation calls in one event, regardless of which agents are involved. Prevents runaway token costs."
   },
   "delegation_timeout": {
-    "description": " 委派超时时间 ",
+    "description": "委派超时时间",
     "type": "float",
     "default": 120.0,
     "hint": "If a delegated agent takes longer than this, it will be cancelled and an error returned."
@@ -34,5 +34,17 @@
     "type": "int",
     "default": 4000,
     "hint": "Rejects task descriptions longer than this to prevent excessive token usage."
+  },
+  "auto_send_trace": {
+    "description": "委派完成后自动发送追踪报告",
+    "type": "bool",
+    "default": false,
+    "hint": "When enabled, the LLM is prompted to call send_delegation_summary after completing all delegations, sending a conversation-style trace report to the user (does not enter LLM context)."
+  },
+  "disable_native_handoffs": {
+    "description": "禁用原生 HandoffTools（transfer_to_* 工具）",
+    "type": "bool",
+    "default": false,
+    "hint": "When enabled, native transfer_to_* HandoffTools are deactivated so the LLM can only delegate via delegate_task_to_agent. This ensures all delegations are tracked in the trace report."
   }
 }
