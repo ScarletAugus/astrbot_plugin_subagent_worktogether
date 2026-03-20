@@ -16,7 +16,6 @@ per-agent call count limiting, and delegation trace reporting
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextvars
 import datetime
 import html as _html
@@ -235,9 +234,7 @@ class SubAgentWorkTogether(Star):
             cfg.get("disable_native_handoffs", _DEFAULT_DISABLE_NATIVE_HANDOFFS),
             _DEFAULT_DISABLE_NATIVE_HANDOFFS,
         )
-        self._last_traces: collections.OrderedDict[str, list[dict]] = (
-            collections.OrderedDict()
-        )
+        self._last_traces: dict[str, list[dict]] = {}
 
     async def initialize(self) -> None:
         self._sync_native_handoff_state()
@@ -451,9 +448,7 @@ class SubAgentWorkTogether(Star):
                 "timestamp": time.time(),
             }
         )
-        self._last_traces[event.unified_msg_origin] = list(trace)
-        if len(self._last_traces) > 1000:
-            self._last_traces.popitem(last=False)
+        self._last_traces = {event.unified_msg_origin: list(trace)}
 
         # --- Auto-send hint (only at top-level, only once per event) ---
         if self.auto_send_trace and current_depth == 0 and not is_error:
