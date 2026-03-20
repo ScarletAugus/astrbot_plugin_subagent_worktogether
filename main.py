@@ -19,7 +19,9 @@ import asyncio
 import collections
 import contextvars
 import datetime
+import html as _html
 import time
+from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -69,6 +71,41 @@ _DEFAULT_AUTO_SEND_TRACE = False
 _DEFAULT_DISABLE_NATIVE_HANDOFFS = False
 
 _ERROR_PREFIX = "[DELEGATION_ERROR]"
+
+
+def _parse_bool(value: object, default: bool = False) -> bool:
+    """Explicitly parse a boolean from config values that might be str/int/bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return default
+
+
+def _safe_int(value: Any, default: int, *, min_val: int | None = None) -> int:
+    """Parse an int from config with fallback and optional minimum."""
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = default
+    if min_val is not None and result < min_val:
+        result = min_val
+    return result
+
+
+def _safe_float(
+    value: Any, default: float, *, min_val: float | None = None
+) -> float:
+    """Parse a float from config with fallback and optional minimum."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = default
+    if min_val is not None and result < min_val:
+        result = min_val
+    return result
 
 _TRACE_HTML_TEMPLATE = """\
 <div style="font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; \
@@ -160,29 +197,43 @@ class SubAgentWorkTogether(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         cfg = config or {}
-        self.max_delegation_depth: int = int(
-            cfg.get("max_delegation_depth", _DEFAULT_MAX_DEPTH)
+        self.max_delegation_depth: int = _safe_int(
+            cfg.get("max_delegation_depth", _DEFAULT_MAX_DEPTH),
+            _DEFAULT_MAX_DEPTH,
+            min_val=1,
         )
-        self.max_calls_per_agent: int = int(
-            cfg.get("max_calls_per_agent", _DEFAULT_MAX_CALLS)
+        self.max_calls_per_agent: int = _safe_int(
+            cfg.get("max_calls_per_agent", _DEFAULT_MAX_CALLS),
+            _DEFAULT_MAX_CALLS,
+            min_val=1,
         )
-        self.max_calls_per_pair: int = int(
-            cfg.get("max_calls_per_pair", _DEFAULT_MAX_CALLS_PER_PAIR)
+        self.max_calls_per_pair: int = _safe_int(
+            cfg.get("max_calls_per_pair", _DEFAULT_MAX_CALLS_PER_PAIR),
+            _DEFAULT_MAX_CALLS_PER_PAIR,
+            min_val=1,
         )
-        self.max_total_delegations: int = int(
-            cfg.get("max_total_delegations", _DEFAULT_MAX_TOTAL_DELEGATIONS)
+        self.max_total_delegations: int = _safe_int(
+            cfg.get("max_total_delegations", _DEFAULT_MAX_TOTAL_DELEGATIONS),
+            _DEFAULT_MAX_TOTAL_DELEGATIONS,
+            min_val=1,
         )
-        self.delegation_timeout: float = float(
-            cfg.get("delegation_timeout", _DEFAULT_DELEGATION_TIMEOUT)
+        self.delegation_timeout: float = _safe_float(
+            cfg.get("delegation_timeout", _DEFAULT_DELEGATION_TIMEOUT),
+            _DEFAULT_DELEGATION_TIMEOUT,
+            min_val=1.0,
         )
-        self.max_task_length: int = int(
-            cfg.get("max_task_length", _DEFAULT_MAX_TASK_LENGTH)
+        self.max_task_length: int = _safe_int(
+            cfg.get("max_task_length", _DEFAULT_MAX_TASK_LENGTH),
+            _DEFAULT_MAX_TASK_LENGTH,
+            min_val=0,
         )
-        self.auto_send_trace: bool = bool(
-            cfg.get("auto_send_trace", _DEFAULT_AUTO_SEND_TRACE)
+        self.auto_send_trace: bool = _parse_bool(
+            cfg.get("auto_send_trace", _DEFAULT_AUTO_SEND_TRACE),
+            _DEFAULT_AUTO_SEND_TRACE,
         )
-        self.disable_native_handoffs: bool = bool(
-            cfg.get("disable_native_handoffs", _DEFAULT_DISABLE_NATIVE_HANDOFFS)
+        self.disable_native_handoffs: bool = _parse_bool(
+            cfg.get("disable_native_handoffs", _DEFAULT_DISABLE_NATIVE_HANDOFFS),
+            _DEFAULT_DISABLE_NATIVE_HANDOFFS,
         )
         self._last_traces: collections.OrderedDict[str, list[dict]] = (
             collections.OrderedDict()
@@ -208,11 +259,15 @@ class SubAgentWorkTogether(Star):
         if not hasattr(request, "func_tool") or not request.func_tool:
             return
 
+        tools = getattr(request.func_tool, "tools", None)
+        if not isinstance(tools, list):
+            return
+
         names_to_remove: set[str] = set()
 
         if self.disable_native_handoffs:
             self._sync_native_handoff_state()
-            for t in request.func_tool.tools:
+            for t in tools:
                 if isinstance(t, HandoffTool):
                     names_to_remove.add(t.name)
 
@@ -222,9 +277,11 @@ class SubAgentWorkTogether(Star):
         if not names_to_remove:
             return
 
-        before = len(request.func_tool.tools)
+        before = len(tools)
         request.func_tool.tools = [
-            t for t in request.func_tool.tools if t.name not in names_to_remove
+            t
+            for t in tools
+            if not (hasattr(t, "name") and t.name in names_to_remove)
         ]
         removed = before - len(request.func_tool.tools)
         if removed:
@@ -336,45 +393,49 @@ class SubAgentWorkTogether(Star):
             )
 
         orch = self.context.subagent_orchestrator
-        if not orch or not orch.handoffs:
-            if agent_name.lower() != MAIN_AGENT_NAME:
-                return f"{_ERROR_PREFIX} No subagent orchestrator configured or no agents available."
 
-        # Increment counts (persist on the event object, no restoration needed)
+        # --- Validate target existence before consuming quota ---
+        caller_name = _current_agent.get() or "(user)"
+        is_main = agent_name.lower() == MAIN_AGENT_NAME
+        handoff = None
+        if not is_main:
+            if not orch or not orch.handoffs:
+                return f"{_ERROR_PREFIX} No subagent orchestrator configured or no agents available."
+            handoff = self._find_handoff(orch.handoffs, agent_name)
+            if not handoff:
+                available = [h.agent.name for h in orch.handoffs] + [MAIN_AGENT_NAME]
+                return (
+                    f"{_ERROR_PREFIX} Agent '{agent_name}' not found. "
+                    f"Available agents: {', '.join(available)}"
+                )
+
+        # Increment counts only after target is confirmed reachable.
         counts[target_key] = current_calls + 1
         ct_counts[target_key] = ct_current + 1
         _increment_total_delegation_count(event)
 
-        # --- Handle delegation to the main agent ---
-        caller_name = _current_agent.get() or "(user)"
-        if agent_name.lower() == MAIN_AGENT_NAME:
+        # --- Perform delegation ---
+        if is_main:
             result = await self._invoke_main_agent(event, task, current_depth)
-        elif not orch or not orch.handoffs:
-            result = f"{_ERROR_PREFIX} No subagent orchestrator configured or no agents available."
         else:
-            handoff = self._find_handoff(orch.handoffs, agent_name)
-            if not handoff:
-                available = [h.agent.name for h in orch.handoffs] + [MAIN_AGENT_NAME]
-                result = (
-                    f"{_ERROR_PREFIX} Agent '{agent_name}' not found. "
-                    f"Available agents: {', '.join(available)}"
+            assert handoff is not None  # guaranteed by early-return above
+            try:
+                llm_resp = await self._invoke_subagent(
+                    event, handoff, task, current_depth
                 )
-            else:
-                try:
-                    llm_resp = await self._invoke_subagent(
-                        event, handoff, task, current_depth
-                    )
-                    result = (
-                        llm_resp.completion_text or "(Agent returned empty response)"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to delegate task to agent '{agent_name}': {e}"
-                    )
-                    result = (
-                        f"{_ERROR_PREFIX} Delegation to agent '{agent_name}' failed: {e}. "
-                        f"Please try to solve the task yourself or use another agent."
-                    )
+                result = (
+                    llm_resp.completion_text or "(Agent returned empty response)"
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to delegate task to agent '%s'",
+                    agent_name,
+                    exc_info=True,
+                )
+                result = (
+                    f"{_ERROR_PREFIX} Delegation to agent '{agent_name}' failed: {e}. "
+                    f"Please try to solve the task yourself or use another agent."
+                )
 
         # --- Record trace entry ---
         is_error = result.startswith(_ERROR_PREFIX)
@@ -462,7 +523,6 @@ class SubAgentWorkTogether(Star):
             return (
                 "Delegation summary has already been sent. Do not call this tool again."
             )
-        event.set_extra("_trace_summary_sent", True)
 
         trace = event.get_extra(_DELEGATION_TRACE_KEY)
         if not trace:
@@ -475,10 +535,15 @@ class SubAgentWorkTogether(Star):
             else:
                 await event.send(MessageChain().file_image(rendered))
         except Exception as exc:
-            logger.warning(f"t2i rendering failed, falling back to text: {exc}")
-            text = self._format_trace_text(trace)
-            await event.send(MessageChain().message(text))
+            logger.warning("t2i rendering failed, falling back to text", exc_info=True)
+            try:
+                text = self._format_trace_text(trace)
+                await event.send(MessageChain().message(text))
+            except Exception:
+                logger.error("Text fallback also failed", exc_info=True)
+                return "Failed to send delegation summary. Please try again."
 
+        event.set_extra("_trace_summary_sent", True)
         return "Delegation summary has been sent to the user."
 
     # ------------------------------------------------------------------ #
@@ -604,14 +669,15 @@ class SubAgentWorkTogether(Star):
             return llm_resp.completion_text or "(Main agent returned empty response)"
         except asyncio.TimeoutError:
             logger.error(
-                f"Delegation to main agent timed out after {self.delegation_timeout}s"
+                "Delegation to main agent timed out after %ss",
+                self.delegation_timeout,
             )
             return (
                 f"{_ERROR_PREFIX} Main agent timed out after {self.delegation_timeout}s. "
                 f"Please try to answer directly."
             )
         except Exception as e:
-            logger.error(f"Failed to delegate task to main agent: {e}")
+            logger.error("Failed to delegate task to main agent", exc_info=True)
             return (
                 f"{_ERROR_PREFIX} Delegation to main agent failed: {e}. "
                 f"Please try to answer directly."
@@ -690,14 +756,16 @@ class SubAgentWorkTogether(Star):
         """Render the delegation trace as an image via html_render."""
         prepared = []
         for entry in trace:
-            task_text = entry["task"]
-            resp_text = entry["response"]
+            task_text = _html.escape(entry["task"])
+            resp_text = _html.escape(entry["response"])
             prepared.append(
                 {
                     **entry,
                     "time_str": datetime.datetime.fromtimestamp(
                         entry["timestamp"]
                     ).strftime("%H:%M:%S"),
+                    "caller": _html.escape(str(entry["caller"])),
+                    "target": _html.escape(str(entry["target"])),
                     "task_short": (
                         task_text[:200] + "..." if len(task_text) > 200 else task_text
                     ),
